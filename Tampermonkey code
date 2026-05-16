@@ -1,0 +1,532 @@
+// ==UserScript==
+// @name         Chess.com Bot Hint Trainer Clean Arrow
+// @namespace    bot-only-chess-trainer-clean
+// @version      1.4
+// @description  Bot-only Stockfish hint arrow. Smaller transparent arrow, auto-clear, constant board sync.
+// @match        https://www.chess.com/*
+// @grant        GM_xmlhttpRequest
+// @connect      127.0.0.1
+// ==/UserScript==
+
+(function () {
+    "use strict";
+
+    const SERVER_URL = "http://127.0.0.1:8765/best";
+
+    const ARROW_WIDTH = 7;
+    const ARROW_OPACITY = 0.45;
+
+    let enabled = true;
+    let playerColor = "w";
+    let arrowSvg = null;
+    let lastFenPieces = "";
+    let currentFenPieces = "";
+    let currentPieceCount = 0;
+
+   function isBotPage() {
+    const url = window.location.href.toLowerCase();
+
+    return (
+        url.includes("/play/computer") ||
+        url.includes("/play/bots") ||
+        url.includes("/game/computer") ||
+        url.includes("/coach") ||
+        url.includes("/play/coach") ||
+        url.includes("/game/coach") ||
+        url.includes("/play/online") ||
+        url.includes("/play/online") ||
+        url.includes("/game/live") ||
+        url.includes("/game/daily") ||
+        url.includes("/play/live") ||
+        url.includes("/live") ||
+        url.includes("/play") ||
+        url.includes("/game") ||
+        url.includes("/puzzles")
+    );
+}
+
+    function makePanel() {
+        const old = document.getElementById("bot-debug-panel");
+        if (old) old.remove();
+
+        const panel = document.createElement("div");
+        panel.id = "bot-debug-panel";
+        panel.style.position = "fixed";
+        panel.style.top = "80px";
+        panel.style.right = "20px";
+        panel.style.zIndex = "999999999";
+        panel.style.background = "#111";
+        panel.style.color = "white";
+        panel.style.padding = "12px";
+        panel.style.borderRadius = "10px";
+        panel.style.fontFamily = "Arial";
+        panel.style.fontSize = "13px";
+        panel.style.width = "285px";
+        panel.style.boxShadow = "0 4px 20px rgba(0,0,0,0.5)";
+
+        panel.innerHTML = `
+            <div style="font-weight:bold;color:#39ff5a;margin-bottom:8px;">
+                Chess Bot
+            </div>
+
+            <div id="bot-url-status" style="font-size:12px;margin-bottom:8px;color:#ddd;"></div>
+
+            <label>
+                <input id="bot-enabled" type="checkbox" checked>
+                Enabled
+            </label>
+
+            <div style="margin-top:8px;margin-bottom:8px;">
+                I play:
+                <select id="bot-color">
+                    <option value="w">White</option>
+                    <option value="b">Black</option>
+                </select>
+            </div>
+
+            <button id="bot-hint" style="
+                width:100%;
+                padding:8px;
+                background:#39ff5a;
+                color:black;
+                border:none;
+                border-radius:7px;
+                font-weight:bold;
+                cursor:pointer;
+                margin-bottom:8px;
+            ">
+                Show Hint
+            </button>
+
+            <button id="bot-clear" style="
+                width:100%;
+                padding:8px;
+                background:#444;
+                color:white;
+                border:none;
+                border-radius:7px;
+                cursor:pointer;
+                margin-bottom:8px;
+            ">
+                Clear Arrow
+            </button>
+
+            <div style="font-size:12px; margin-bottom:4px; color:#aaa;">
+                H = hint, C = clear
+            </div>
+
+            <div id="bot-sync" style="font-size:12px;color:#aaa;margin-bottom:4px;">
+                Board: syncing...
+            </div>
+
+            <div id="bot-status" style="font-size:12px;color:#ccc;">
+                Status: loading
+            </div>
+        `;
+
+        document.body.appendChild(panel);
+
+        document.getElementById("bot-enabled").onchange = function () {
+            enabled = this.checked;
+            if (!enabled) {
+                clearArrow(false);
+                setStatus("disabled");
+            } else {
+                setStatus("enabled");
+            }
+        };
+
+        document.getElementById("bot-color").onchange = function () {
+            playerColor = this.value;
+            clearArrow(false);
+            setStatus("playing as " + (playerColor === "w" ? "white" : "black"));
+        };
+
+        document.getElementById("bot-hint").onclick = showHint;
+
+        document.getElementById("bot-clear").onclick = function () {
+            clearArrow(true);
+        };
+
+        updateUrlStatus();
+    }
+
+    function updateUrlStatus() {
+        const el = document.getElementById("bot-url-status");
+        if (!el) return;
+
+        if (isBotPage()) {
+            el.innerHTML = `<span style="color:#39ff5a;">BOT PAGE DETECTED</span>`;
+        } else {
+            el.innerHTML = `<span style="color:#ff4d4d;">BLOCKED: Not a bot page</span>`;
+        }
+    }
+
+    function setStatus(msg) {
+        const el = document.getElementById("bot-status");
+        if (el) el.textContent = "Status: " + msg;
+        console.log("[Bot Hint]", msg);
+    }
+
+    function setSyncStatus(msg) {
+        const el = document.getElementById("bot-sync");
+        if (el) el.textContent = "Board: " + msg;
+    }
+
+    function findBoard() {
+        const selectors = [
+            "wc-chess-board",
+            "chess-board",
+            ".board",
+            ".game-board",
+            "[class*='board']"
+        ];
+
+        for (const selector of selectors) {
+            const items = Array.from(document.querySelectorAll(selector));
+
+            for (const item of items) {
+                const rect = item.getBoundingClientRect();
+
+                if (rect.width >= 300 && rect.height >= 300) {
+                    return item;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    function getPieces() {
+        return Array.from(document.querySelectorAll(".piece")).filter(piece => {
+            const classes = Array.from(piece.classList);
+
+            const hasSquare = classes.some(cls => /^square-\d\d$/.test(cls));
+            const hasPiece = classes.some(cls => /^[wb][pnbrqk]$/.test(cls));
+
+            return hasSquare && hasPiece;
+        });
+    }
+
+    function parsePiece(pieceEl) {
+        const classes = Array.from(pieceEl.classList);
+
+        const pieceClass = classes.find(cls => /^[wb][pnbrqk]$/.test(cls));
+        const squareClass = classes.find(cls => /^square-\d\d$/.test(cls));
+
+        if (!pieceClass || !squareClass) return null;
+
+        const color = pieceClass[0];
+        const piece = pieceClass[1];
+
+        const sq = squareClass.replace("square-", "");
+        const fileNumber = parseInt(sq[0], 10);
+        const rankNumber = parseInt(sq[1], 10);
+
+        if (
+            Number.isNaN(fileNumber) ||
+            Number.isNaN(rankNumber) ||
+            fileNumber < 1 ||
+            fileNumber > 8 ||
+            rankNumber < 1 ||
+            rankNumber > 8
+        ) {
+            return null;
+        }
+
+        const files = "abcdefgh";
+        const square = files[fileNumber - 1] + rankNumber;
+
+        let fenPiece = piece;
+        if (color === "w") fenPiece = piece.toUpperCase();
+
+        return {
+            square: square,
+            fenPiece: fenPiece
+        };
+    }
+
+    function boardToFenPieces() {
+        const board = {};
+        const pieces = getPieces();
+
+        currentPieceCount = pieces.length;
+
+        for (const piece of pieces) {
+            const parsed = parsePiece(piece);
+            if (parsed) {
+                board[parsed.square] = parsed.fenPiece;
+            }
+        }
+
+        let fen = "";
+
+        for (let rank = 8; rank >= 1; rank--) {
+            let empty = 0;
+
+            for (let fileIndex = 0; fileIndex < 8; fileIndex++) {
+                const square = "abcdefgh"[fileIndex] + rank;
+                const piece = board[square];
+
+                if (piece) {
+                    if (empty > 0) {
+                        fen += empty;
+                        empty = 0;
+                    }
+                    fen += piece;
+                } else {
+                    empty++;
+                }
+            }
+
+            if (empty > 0) fen += empty;
+            if (rank > 1) fen += "/";
+        }
+
+        return fen;
+    }
+
+    function buildFen() {
+        return `${currentFenPieces} ${playerColor} - - 0 1`;
+    }
+
+    function syncBoardConstantly() {
+        if (!isBotPage()) {
+            setSyncStatus("blocked");
+            return;
+        }
+
+        const board = findBoard();
+
+        if (!board) {
+            setSyncStatus("not found");
+            return;
+        }
+
+        const newFenPieces = boardToFenPieces();
+
+        if (!newFenPieces || currentPieceCount === 0) {
+            setSyncStatus("pieces not found");
+            return;
+        }
+
+        currentFenPieces = newFenPieces;
+
+        if (lastFenPieces === "") {
+            lastFenPieces = currentFenPieces;
+            setSyncStatus("ready, pieces: " + currentPieceCount);
+            return;
+        }
+
+        if (currentFenPieces !== lastFenPieces) {
+            lastFenPieces = currentFenPieces;
+
+            if (arrowSvg) {
+                clearArrow(false);
+                setStatus("move detected, arrow cleared");
+            }
+
+            setSyncStatus("updated, pieces: " + currentPieceCount);
+        } else {
+            setSyncStatus("ready, pieces: " + currentPieceCount);
+        }
+    }
+
+    function requestBestMove(fen) {
+        return new Promise((resolve, reject) => {
+            const url = SERVER_URL + "?fen=" + encodeURIComponent(fen);
+
+            GM_xmlhttpRequest({
+                method: "GET",
+                url: url,
+
+                onload: function (response) {
+                    try {
+                        const data = JSON.parse(response.responseText);
+
+                        if (data.error) {
+                            reject(new Error(data.error));
+                            return;
+                        }
+
+                        if (!data.bestmove || data.bestmove === "(none)") {
+                            reject(new Error("no best move returned"));
+                            return;
+                        }
+
+                        resolve(data.bestmove);
+                    } catch (err) {
+                        reject(new Error("bad JSON from server"));
+                    }
+                },
+
+                onerror: function () {
+                    reject(new Error("could not connect to server"));
+                }
+            });
+        });
+    }
+
+    function getBoardRect() {
+        const board = findBoard();
+        if (!board) return null;
+        return board.getBoundingClientRect();
+    }
+
+    function isFlipped() {
+        return playerColor === "b";
+    }
+
+    function squareToPoint(square) {
+        const rect = getBoardRect();
+        if (!rect) return null;
+
+        const files = "abcdefgh";
+
+        let fileIndex = files.indexOf(square[0]);
+        let rankIndex = 8 - parseInt(square[1], 10);
+
+        if (isFlipped()) {
+            fileIndex = 7 - fileIndex;
+            rankIndex = 7 - rankIndex;
+        }
+
+        const size = rect.width / 8;
+
+        return {
+            x: rect.left + fileIndex * size + size / 2,
+            y: rect.top + rankIndex * size + size / 2
+        };
+    }
+
+    function clearArrow(showMessage) {
+        if (arrowSvg) {
+            arrowSvg.remove();
+            arrowSvg = null;
+        }
+
+        if (showMessage) {
+            setStatus("arrow cleared");
+        }
+    }
+
+    function drawArrow(move) {
+        clearArrow(false);
+
+        const from = move.slice(0, 2);
+        const to = move.slice(2, 4);
+
+        const start = squareToPoint(from);
+        const end = squareToPoint(to);
+
+        if (!start || !end) {
+            setStatus("could not draw arrow");
+            return;
+        }
+
+        const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+        svg.style.position = "fixed";
+        svg.style.left = "0";
+        svg.style.top = "0";
+        svg.style.width = "100vw";
+        svg.style.height = "100vh";
+        svg.style.pointerEvents = "none";
+        svg.style.zIndex = "999999998";
+
+        const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
+
+        const marker = document.createElementNS("http://www.w3.org/2000/svg", "marker");
+        marker.setAttribute("id", "hint-arrow-head-small");
+        marker.setAttribute("markerWidth", "10");
+        marker.setAttribute("markerHeight", "10");
+        marker.setAttribute("refX", "7");
+        marker.setAttribute("refY", "3");
+        marker.setAttribute("orient", "auto");
+        marker.setAttribute("markerUnits", "strokeWidth");
+
+        const head = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        head.setAttribute("d", "M0,0 L0,6 L8,3 z");
+        head.setAttribute("fill", "#25ff4a");
+        head.setAttribute("opacity", ARROW_OPACITY);
+
+        marker.appendChild(head);
+        defs.appendChild(marker);
+        svg.appendChild(defs);
+
+        const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+        line.setAttribute("x1", start.x);
+        line.setAttribute("y1", start.y);
+        line.setAttribute("x2", end.x);
+        line.setAttribute("y2", end.y);
+        line.setAttribute("stroke", "#25ff4a");
+        line.setAttribute("stroke-width", ARROW_WIDTH);
+        line.setAttribute("stroke-linecap", "round");
+        line.setAttribute("opacity", ARROW_OPACITY);
+        line.setAttribute("marker-end", "url(#hint-arrow-head-small)");
+
+        svg.appendChild(line);
+        document.body.appendChild(svg);
+
+        arrowSvg = svg;
+
+        setStatus("best move: " + move);
+    }
+
+    async function showHint() {
+        if (!enabled) {
+            setStatus("disabled");
+            return;
+        }
+
+        if (!isBotPage()) {
+            setStatus("blocked because this is not a bot page");
+            return;
+        }
+
+        syncBoardConstantly();
+
+        if (!currentFenPieces || currentPieceCount === 0) {
+            setStatus("board not ready yet");
+            return;
+        }
+
+        try {
+            const fen = buildFen();
+
+            setStatus("thinking...");
+
+            const move = await requestBestMove(fen);
+
+            drawArrow(move);
+
+        } catch (err) {
+            setStatus("error: " + err.message);
+        }
+    }
+
+    function addKeys() {
+        document.addEventListener("keydown", function (e) {
+            if (e.key.toLowerCase() === "h") {
+                showHint();
+            }
+
+            if (e.key.toLowerCase() === "c") {
+                clearArrow(true);
+            }
+        });
+    }
+
+    function boot() {
+        makePanel();
+        addKeys();
+
+        setStatus("loaded");
+
+        setInterval(updateUrlStatus, 1000);
+
+        // Constant board checking.
+        setInterval(syncBoardConstantly, 300);
+    }
+
+    boot();
+})();
